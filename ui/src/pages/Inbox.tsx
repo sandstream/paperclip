@@ -42,6 +42,7 @@ import { PageTabBar } from "../components/PageTabBar";
 import type { Approval, HeartbeatRun, Issue, JoinRequest } from "@paperclipai/shared";
 import {
   ACTIONABLE_APPROVAL_STATUSES,
+  ACTIONABLE_ISSUE_STATUSES,
   getApprovalsForTab,
   getInboxWorkItems,
   getLatestFailedRunsByAgent,
@@ -887,6 +888,17 @@ export function Inbox() {
                     }
                     unreadState={isUnread ? "visible" : isFading ? "fading" : "hidden"}
                     onMarkRead={() => markReadMutation.mutate(issue.id)}
+                    desktopTrailing={
+                      ACTIONABLE_ISSUE_STATUSES.has(issue.status) ? (
+                        <span className={
+                          issue.status === "blocked"
+                            ? "rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-400"
+                            : "rounded-full bg-violet-100 px-2 py-0.5 text-[11px] font-medium text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                        }>
+                          {issue.status === "blocked" ? "Needs your input" : "Needs review"}
+                        </span>
+                      ) : undefined
+                    }
                     trailingMeta={
                       issue.lastExternalCommentAt
                         ? `commented ${timeAgo(issue.lastExternalCommentAt)}`

@@ -124,7 +124,7 @@ export function getRecentTouchedIssues(issues: Issue[]): Issue[] {
 }
 
 export function getUnreadTouchedIssues(issues: Issue[]): Issue[] {
-  return issues.filter((issue) => issue.isUnreadForMe && ACTIONABLE_ISSUE_STATUSES.has(issue.status));
+  return issues.filter((issue) => issue.isUnreadForMe);
 }
 
 export function getApprovalsForTab(
