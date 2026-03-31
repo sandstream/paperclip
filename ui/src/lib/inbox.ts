@@ -8,6 +8,7 @@ import type {
 
 export const RECENT_ISSUES_LIMIT = 100;
 export const FAILED_RUN_STATUSES = new Set(["failed", "timed_out"]);
+export const ACTIONABLE_ISSUE_STATUSES = new Set(["blocked", "in_review"]);
 export const ACTIONABLE_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
 export const DISMISSED_KEY = "paperclip:inbox:dismissed";
 export const INBOX_LAST_TAB_KEY = "paperclip:inbox:last-tab";
@@ -123,7 +124,7 @@ export function getRecentTouchedIssues(issues: Issue[]): Issue[] {
 }
 
 export function getUnreadTouchedIssues(issues: Issue[]): Issue[] {
-  return issues.filter((issue) => issue.isUnreadForMe);
+  return issues.filter((issue) => issue.isUnreadForMe && ACTIONABLE_ISSUE_STATUSES.has(issue.status));
 }
 
 export function getApprovalsForTab(
