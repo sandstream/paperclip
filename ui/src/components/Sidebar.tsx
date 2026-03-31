@@ -35,7 +35,8 @@ export function Sidebar() {
     enabled: !!selectedCompanyId,
     refetchInterval: 10_000,
   });
-  const liveRunCount = liveRuns?.length ?? 0;
+  const runningCount = liveRuns?.filter(r => r.status === 'running').length ?? 0;
+  const queuedCount = liveRuns?.filter(r => r.status === 'queued').length ?? 0;
 
   function openSearch() {
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
@@ -79,7 +80,7 @@ export function Sidebar() {
             <SquarePen className="h-4 w-4 shrink-0" />
             <span className="truncate">New Issue</span>
           </button>
-          <SidebarNavItem to="/dashboard" label="Dashboard" icon={LayoutDashboard} liveCount={liveRunCount} />
+          <SidebarNavItem to="/dashboard" label="Dashboard" icon={LayoutDashboard} runningCount={runningCount} queuedCount={queuedCount} />
           <SidebarNavItem
             to="/inbox"
             label="Inbox"

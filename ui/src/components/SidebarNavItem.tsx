@@ -14,7 +14,8 @@ interface SidebarNavItemProps {
   textBadge?: string;
   textBadgeTone?: "default" | "amber";
   alert?: boolean;
-  liveCount?: number;
+  runningCount?: number;
+  queuedCount?: number;
 }
 
 export function SidebarNavItem({
@@ -28,9 +29,20 @@ export function SidebarNavItem({
   textBadge,
   textBadgeTone = "default",
   alert = false,
-  liveCount,
+  runningCount,
+  queuedCount,
 }: SidebarNavItemProps) {
   const { isMobile, setSidebarOpen } = useSidebar();
+
+  const liveLabel = (() => {
+    const running = runningCount ?? 0;
+    const queued = queuedCount ?? 0;
+    if (running === 0 && queued === 0) return null;
+    const parts: string[] = [];
+    if (running > 0) parts.push(`${running} running`);
+    if (queued > 0) parts.push(`${queued} queued`);
+    return parts.join(", ");
+  })();
 
   return (
     <NavLink
@@ -66,13 +78,13 @@ export function SidebarNavItem({
           {textBadge}
         </span>
       )}
-      {liveCount != null && liveCount > 0 && (
+      {liveLabel && (
         <span className="ml-auto flex items-center gap-1.5">
           <span className="relative flex h-2 w-2">
             <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
           </span>
-          <span className="text-[11px] font-medium text-blue-600 dark:text-blue-400">{liveCount} live</span>
+          <span className="text-[11px] font-medium text-blue-600 dark:text-blue-400">{liveLabel}</span>
         </span>
       )}
       {badge != null && badge > 0 && (
