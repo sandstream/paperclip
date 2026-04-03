@@ -1,6 +1,11 @@
 import type { ServerAdapterModule } from "./types.js";
 import { getAdapterSessionManagement } from "@paperclipai/adapter-utils";
 import {
+  execute as ollamaExecute,
+  testEnvironment as ollamaTestEnvironment,
+} from "@paperclipai/adapter-ollama-local/server";
+import { agentConfigurationDoc as ollamaAgentConfigurationDoc, models as ollamaModels } from "@paperclipai/adapter-ollama-local";
+import {
   execute as claudeExecute,
   listClaudeSkills,
   syncClaudeSkills,
@@ -181,9 +186,19 @@ const hermesLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: hermesAgentConfigurationDoc,
 };
 
+const ollamaLocalAdapter: ServerAdapterModule = {
+  type: "ollama_local",
+  execute: ollamaExecute,
+  testEnvironment: ollamaTestEnvironment,
+  models: ollamaModels,
+  supportsLocalAgentJwt: false,
+  agentConfigurationDoc: ollamaAgentConfigurationDoc,
+};
+
 const adaptersByType = new Map<string, ServerAdapterModule>(
   [
     claudeLocalAdapter,
+    ollamaLocalAdapter,
     codexLocalAdapter,
     openCodeLocalAdapter,
     piLocalAdapter,

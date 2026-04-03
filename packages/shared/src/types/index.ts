@@ -22,6 +22,13 @@ export type {
   CompanySkillFileUpdateRequest,
 } from "./company-skill.js";
 export type {
+  SkillTrigger,
+  SkillManifestV2,
+  TaskContext,
+  ScoredSkill,
+  SkillInjectionResult,
+} from "./skill-manifest.js";
+export type {
   AgentSkillSyncMode,
   AgentSkillState,
   AgentSkillOrigin,

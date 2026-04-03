@@ -155,6 +155,11 @@ export type {
   CompanySkillCreateRequest,
   CompanySkillFileDetail,
   CompanySkillFileUpdateRequest,
+  SkillManifestV2,
+  SkillTrigger,
+  TaskContext,
+  ScoredSkill,
+  SkillInjectionResult,
   AgentSkillSyncMode,
   AgentSkillState,
   AgentSkillOrigin,
@@ -580,3 +585,10 @@ export {
   type SecretsLocalEncryptedConfig,
   type ConfigMeta,
 } from "./config-schema.js";
+
+export {
+  parseSkillManifest,
+  scoreSkillRelevance,
+  estimateSkillTokens,
+  selectSkillsForInjection,
+} from "./skill-scoring.js";

@@ -27,6 +27,11 @@ import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } fr
 import { costService } from "./costs.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
+import {
+  parseSkillManifest,
+  selectSkillsForInjection,
+  type TaskContext,
+} from "@paperclipai/shared";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { summarizeHeartbeatRunResultJson } from "./heartbeat-run-summary.js";
@@ -1932,6 +1937,89 @@ export function heartbeatService(db: Db) {
     });
   }
 
+  /**
+   * Filter runtime skills based on task context using relevance scoring
+   */
+  async function filterSkillsByRelevance(
+    companyId: string,
+    agentRole: string | null,
+    issueContext: {
+      id: string;
+      identifier: string;
+      title: string;
+      description?: string | null;
+      projectId: string | null;
+      labels?: Array<{ name: string }>;
+    } | null,
+    gateNumber?: number,
+  ) {
+    // Get all available skills
+    const allSkills = await companySkills.listFull(companyId);
+    
+    // If no issue context, return all skills (backward compatibility)
+    if (!issueContext) {
+      return companySkills.listRuntimeSkillEntries(companyId);
+    }
+
+    // Build task context for scoring
+    const taskContext: TaskContext = {
+      gateNumber,
+      projectId: issueContext.projectId ?? undefined,
+      agentRole: agentRole ?? undefined,
+      title: issueContext.title,
+      description: issueContext.description ?? undefined,
+      labels: issueContext.labels?.map((l) => l.name) ?? undefined,
+    };
+
+    // Parse manifests and score skills
+    const skillsForScoring = allSkills.map((skill) => {
+      const frontmatter = skill.metadata as Record<string, unknown> ?? {};
+      const manifest = parseSkillManifest(frontmatter);
+      
+      return {
+        id: skill.id,
+        key: skill.key,
+        slug: skill.slug,
+        name: skill.name,
+        markdown: skill.markdown,
+        manifest,
+        sourceType: skill.sourceType,
+        sourceLocator: skill.sourceLocator,
+        trustLevel: skill.trustLevel,
+      };
+    });
+
+    // Apply relevance scoring and select top skills
+    const injectionResult = selectSkillsForInjection(skillsForScoring, taskContext, {
+      maxTotalTokens: 8000,
+      minRelevanceScore: 0.1,
+    });
+
+    // Convert selected skills back to runtime entries
+    const selectedSkillIds = new Set(injectionResult.selectedSkills.map((s) => s.id));
+    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId);
+    
+    // Filter runtime entries to only include selected skills
+    const filtered = runtimeSkillEntries.filter((entry) => {
+      const skill = allSkills.find((s) => s.key === entry.key);
+      return skill && selectedSkillIds.has(skill.id);
+    });
+
+    // Log exclusions for debugging
+    if (injectionResult.excludedSkills.length > 0) {
+      logger.debug(
+        {
+          issueId: issueContext.id,
+          excluded: injectionResult.excludedSkills.length,
+          budgetExcluded: injectionResult.budgetExcludedSkills.length,
+        },
+        "Skills filtered by relevance",
+      );
+    }
+
+    return filtered;
+  }
+
   async function executeRun(runId: string) {
     let run = await getRun(runId);
     if (!run) return;
@@ -1976,6 +2064,7 @@ export function heartbeatService(db: Db) {
             id: issues.id,
             identifier: issues.identifier,
             title: issues.title,
+            description: issues.description,
             projectId: issues.projectId,
             projectWorkspaceId: issues.projectWorkspaceId,
             executionWorkspaceId: issues.executionWorkspaceId,
@@ -2055,7 +2144,13 @@ export function heartbeatService(db: Db) {
       agent.companyId,
       mergedConfig,
     );
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId);
+    // Apply skill filtering based on relevance scoring
+    const runtimeSkillEntries = await filterSkillsByRelevance(
+      agent.companyId,
+      agent.role,
+      issueContext,
+      undefined, // gateNumber - can be added later when gate tracking is implemented
+    );
     const runtimeConfig = {
       ...resolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
@@ -2378,7 +2473,7 @@ export function heartbeatService(db: Db) {
         eventType: "lifecycle",
         stream: "system",
         level: "info",
-        message: "run started",
+        message: "run started: " + agent.name + " [" + agent.adapterType + (config.model ? " " + String(config.model) : "") + "]",
       });
 
       handle = await runLogStore.begin({
@@ -2492,7 +2587,7 @@ export function heartbeatService(db: Db) {
           eventType: "adapter.invoke",
           stream: "system",
           level: "info",
-          message: "adapter invocation",
+          message: "adapter invocation: " + agent.adapterType + (config.model ? " model=" + String(config.model) : ""),
           payload: meta as unknown as Record<string, unknown>,
         });
       };

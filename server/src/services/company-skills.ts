@@ -2331,6 +2331,105 @@ export function companySkillService(db: Db) {
     return skill;
   }
 
+  async function listScoredRuntimeSkillEntries(
+    companyId: string,
+    context: {
+      gateNumber?: number;
+      domain?: string;
+      labels?: string[];
+      title?: string;
+      description?: string;
+      projectId?: string;
+      agentRole?: string;
+    },
+    options?: {
+      minScoreThreshold?: number;
+      maxTotalTokens?: number;
+    },
+  ) {
+    const { selectRelevantSkills, parseSkillManifest } = await import("@paperclipai/shared");
+    const skills = await listFull(companyId);
+    
+    // Prepare skills for scoring
+    const skillsForScoring = await Promise.all(
+      skills.map(async (skill) => {
+        let markdownContent = "";
+        let manifest;
+        
+        try {
+          // Try to read the SKILL.md file
+          const skillDir = normalizeSkillDirectory(skill);
+          if (skillDir) {
+            const skillFilePath = path.join(skillDir, "SKILL.md");
+            markdownContent = await fs.readFile(skillFilePath, "utf8");
+            const parsed = parseFrontmatterMarkdown(markdownContent);
+            manifest = parseSkillManifest(parsed.frontmatter);
+          } else {
+            // Fallback: use basic manifest
+            manifest = parseSkillManifest({
+              name: skill.name,
+              description: skill.description,
+            });
+          }
+        } catch {
+          // If we can't read the file, create a basic manifest
+          manifest = parseSkillManifest({
+            name: skill.name,
+            description: skill.description,
+          });
+        }
+        
+        return {
+          id: skill.id,
+          key: skill.key,
+          slug: skill.slug,
+          name: skill.name,
+          manifest,
+          markdownContent,
+        };
+      })
+    );
+    
+    // Score and select relevant skills
+    const injectionResult = selectRelevantSkills(skillsForScoring, context, {
+      minScoreThreshold: options?.minScoreThreshold,
+      maxTotalTokens: options?.maxTotalTokens,
+    });
+    
+    // Convert selected scored skills to runtime entries
+    const runtimeEntries = await Promise.all(
+      injectionResult.selectedSkills.map(async (scoredSkill) => {
+        const skill = skills.find((s) => s.id === scoredSkill.id);
+        if (!skill) return null;
+        
+        const sourceKind = asString(getSkillMeta(skill).sourceKind);
+        let source = normalizeSkillDirectory(skill);
+        if (!source) {
+          source = await materializeRuntimeSkillFiles(companyId, skill).catch(() => null);
+        }
+        if (!source) return null;
+        
+        const required = sourceKind === "paperclip_bundled";
+        return {
+          key: skill.key,
+          runtimeName: buildSkillRuntimeName(skill.key, skill.slug),
+          source,
+          required,
+          requiredReason: required
+            ? "Bundled Paperclip skills are always available for local adapters."
+            : null,
+          relevanceScore: scoredSkill.score,
+          scoreReason: scoredSkill.scoreReason,
+        };
+      })
+    );
+    
+    return {
+      entries: runtimeEntries.filter((e): e is NonNullable<typeof e> => e !== null),
+      injectionResult,
+    };
+  }
+
   return {
     list,
     listFull,
@@ -2351,5 +2450,6 @@ export function companySkillService(db: Db) {
     importPackageFiles,
     installUpdate,
     listRuntimeSkillEntries,
+    listScoredRuntimeSkillEntries,
   };
 }
