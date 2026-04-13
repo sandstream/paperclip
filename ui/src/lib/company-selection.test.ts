@@ -12,14 +12,14 @@ describe("shouldSyncCompanySelectionFromRoute", () => {
     ).toBe(false);
   });
 
-  it("defers route sync while a manual company switch is in flight", () => {
+  it("syncs from route even after a manual company switch (deep link wins)", () => {
     expect(
       shouldSyncCompanySelectionFromRoute({
         selectionSource: "manual",
         selectedCompanyId: "pap",
         routeCompanyId: "ret",
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("syncs back to the route company for non-manual mismatches", () => {

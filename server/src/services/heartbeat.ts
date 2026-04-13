@@ -20,7 +20,7 @@ import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import { findServerAdapter, getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec, UsageSummary } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
@@ -57,6 +57,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import { logActivity } from "./activity-log.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -413,6 +414,12 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
   };
 }
 
+function readRawCostUsd(usageJson: unknown): number | null {
+  const parsed = parseObject(usageJson);
+  const raw = asNumber(parsed.rawCostUsd, asNumber(parsed.costUsd, NaN));
+  return Number.isFinite(raw) ? raw : null;
+}
+
 function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: UsageTotals | null): UsageTotals | null {
   if (!current) return null;
   if (!previous) return { ...current };
@@ -432,6 +439,12 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
     cachedInputTokens: Math.max(0, cachedInputTokens),
     outputTokens: Math.max(0, outputTokens),
   };
+}
+
+function deriveNormalizedCostDelta(current: number | null | undefined, previous: number | null): number | null {
+  if (current == null || !Number.isFinite(current)) return null;
+  if (previous == null) return current;
+  return current >= previous ? current - previous : current;
 }
 
 function formatCount(value: number | null | undefined) {
@@ -871,11 +884,13 @@ export function heartbeatService(db: Db) {
     runId: string;
     sessionId: string | null;
     rawUsage: UsageTotals | null;
+    rawCostUsd?: number | null;
   }) {
-    const { agentId, runId, sessionId, rawUsage } = input;
+    const { agentId, runId, sessionId, rawUsage, rawCostUsd } = input;
     if (!sessionId || !rawUsage) {
       return {
         normalizedUsage: rawUsage,
+        normalizedCostUsd: rawCostUsd ?? null,
         previousRawUsage: null as UsageTotals | null,
         derivedFromSessionTotals: false,
       };
@@ -883,8 +898,10 @@ export function heartbeatService(db: Db) {
 
     const previousRun = await getLatestRunForSession(agentId, sessionId, { excludeRunId: runId });
     const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
+    const previousRawCostUsd = readRawCostUsd(previousRun?.usageJson);
     return {
       normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
+      normalizedCostUsd: deriveNormalizedCostDelta(rawCostUsd, previousRawCostUsd),
       previousRawUsage,
       derivedFromSessionTotals: previousRawUsage !== null,
     };
@@ -1625,6 +1642,56 @@ export function heartbeatService(db: Db) {
     };
   }
 
+  function isRateLimitError(msg: string | null | undefined, code?: string | null): boolean {
+    const combined = [msg ?? "", code ?? ""].join(" ").toLowerCase();
+    return /rate.?limit|overloaded|hit your limit|you.ve hit/.test(combined);
+  }
+
+  function parseResetAtFromError(msg: string | null | undefined): Date | null {
+    if (!msg) return null;
+    // Match "resets Apr 10, 4am (UTC)" or "resets Apr 10, 4:30pm"
+    const m = msg.match(/resets\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\([^)]+\))?/i);
+    if (!m) return null;
+    try {
+      const [, monthStr, dayStr, hourStr, minStr, ampm] = m;
+      const year = new Date().getFullYear();
+      let hour = parseInt(hourStr, 10);
+      const min = parseInt(minStr ?? "0", 10);
+      if (ampm.toLowerCase() === "pm" && hour < 12) hour += 12;
+      if (ampm.toLowerCase() === "am" && hour === 12) hour = 0;
+      const d = new Date(Date.UTC(year, new Date(`${monthStr} 1`).getMonth(), parseInt(dayStr, 10), hour, min));
+      if (!isNaN(d.getTime())) return d;
+    } catch { /* ignore */ }
+    return null;
+  }
+
+  async function resolveRateLimitResetAt(
+    adapterType: string,
+    errorMessage: string | null | undefined,
+    stderrExcerpt: string | null | undefined,
+  ): Promise<Date | null> {
+    if (!isRateLimitError(errorMessage, stderrExcerpt)) return null;
+
+    // 1. Parse reset time directly from error message
+    const fromError = parseResetAtFromError(errorMessage) ?? parseResetAtFromError(stderrExcerpt);
+    if (fromError) return fromError;
+
+    // 2. Fallback: ask the adapter quota API
+    try {
+      const adapter = findServerAdapter(adapterType);
+      if (!adapter?.getQuotaWindows) return null;
+      const result = await adapter.getQuotaWindows();
+      if (!result.ok || !result.windows?.length) return null;
+      for (const w of result.windows) {
+        if (w.resetsAt) return new Date(w.resetsAt);
+      }
+    } catch {
+      // ignore quota fetch errors
+    }
+    return null;
+  }
+
+
   async function countRunningRunsForAgent(agentId: string) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
@@ -1852,6 +1919,7 @@ export function heartbeatService(db: Db) {
     result: AdapterExecutionResult,
     session: { legacySessionId: string | null },
     normalizedUsage?: UsageTotals | null,
+    normalizedCostUsd?: number | null,
   ) {
     await ensureRuntimeState(agent);
     const usage = normalizedUsage ?? normalizeUsageTotals(result.usage);
@@ -1859,7 +1927,8 @@ export function heartbeatService(db: Db) {
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
-    const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
+    const effectiveCostUsd = normalizedCostUsd !== undefined ? normalizedCostUsd : result.costUsd;
+    const additionalCostCents = normalizeBilledCostCents(effectiveCostUsd, billingType);
     const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
     const provider = result.provider ?? "unknown";
     const biller = resolveLedgerBiller(result);
@@ -1945,7 +2014,7 @@ export function heartbeatService(db: Db) {
     agentRole: string | null,
     issueContext: {
       id: string;
-      identifier: string;
+      identifier: string | null;
       title: string;
       description?: string | null;
       projectId: string | null;
@@ -1981,18 +2050,15 @@ export function heartbeatService(db: Db) {
         key: skill.key,
         slug: skill.slug,
         name: skill.name,
-        markdown: skill.markdown,
+        markdownContent: skill.markdown,
         manifest,
-        sourceType: skill.sourceType,
-        sourceLocator: skill.sourceLocator,
-        trustLevel: skill.trustLevel,
       };
     });
 
     // Apply relevance scoring and select top skills
     const injectionResult = selectSkillsForInjection(skillsForScoring, taskContext, {
       maxTotalTokens: 8000,
-      minRelevanceScore: 0.1,
+      minScoreThreshold: 0.1,
     });
 
     // Convert selected skills back to runtime entries
@@ -2140,9 +2206,17 @@ export function heartbeatService(db: Db) {
     const mergedConfig = issueAssigneeOverrides?.adapterConfig
       ? { ...workspaceManagedConfig, ...issueAssigneeOverrides.adapterConfig }
       : workspaceManagedConfig;
+
+    // Model tier escalation: 0=Haiku, 1=Sonnet, 2=Opus
+    const TIER_MODELS = ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-6"] as const;
+    const agentMeta = (agent.metadata ?? {}) as Record<string, unknown>;
+    const modelTier = Math.min(2, Math.max(0, asNumber(agentMeta.modelTier, 0)));
+    const tierModel = TIER_MODELS[modelTier];
+    const mergedConfigWithTier = { ...mergedConfig, model: tierModel };
+
     const { config: resolvedConfig, secretKeys } = await secretsSvc.resolveAdapterConfigForRuntime(
       agent.companyId,
-      mergedConfig,
+      mergedConfigWithTier,
     );
     // Apply skill filtering based on relevance scoring
     const runtimeSkillEntries = await filterSkillsByRelevance(
@@ -2681,8 +2755,10 @@ export function heartbeatService(db: Db) {
         runId: run.id,
         sessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId,
         rawUsage,
+        rawCostUsd: adapterResult.costUsd,
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
+      const normalizedCostUsd = sessionUsageResolution.normalizedCostUsd;
 
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
@@ -2731,7 +2807,7 @@ export function heartbeatService(db: Db) {
               provider: readNonEmptyString(adapterResult.provider) ?? "unknown",
               biller: resolveLedgerBiller(adapterResult),
               model: readNonEmptyString(adapterResult.model) ?? "unknown",
-              ...(adapterResult.costUsd != null ? { costUsd: adapterResult.costUsd } : {}),
+              ...(adapterResult.costUsd != null ? { costUsd: normalizedCostUsd, rawCostUsd: adapterResult.costUsd } : {}),
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
             } as Record<string, unknown>)
           : null;
@@ -2782,13 +2858,42 @@ export function heartbeatService(db: Db) {
             exitCode: adapterResult.exitCode,
           },
         });
+
+        const runEventAction = outcome === "succeeded"
+          ? "agent.run.finished"
+          : outcome === "cancelled"
+            ? "agent.run.cancelled"
+            : "agent.run.failed";
+        const runContext = parseObject(finalizedRun.contextSnapshot);
+        await logActivity(db, {
+          companyId: agent.companyId,
+          actorType: "agent",
+          actorId: agent.id,
+          action: runEventAction,
+          entityType: "agent",
+          entityId: agent.id,
+          agentId: agent.id,
+          runId: finalizedRun.id,
+          details: {
+            runId: finalizedRun.id,
+            agentId: agent.id,
+            issueId: readNonEmptyString(runContext.issueId) ?? null,
+            model: readNonEmptyString(adapterResult.model) ?? "unknown",
+            provider: readNonEmptyString(adapterResult.provider) ?? "unknown",
+            exitCode: adapterResult.exitCode,
+            outcome,
+          },
+        }).catch((err) => {
+          logger.warn({ err, runId: finalizedRun.id }, "failed to emit plugin run event");
+        });
+
         await releaseIssueExecutionAndPromote(finalizedRun);
       }
 
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
-        }, normalizedUsage);
+        }, normalizedUsage, normalizedCostUsd);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
@@ -2810,6 +2915,109 @@ export function heartbeatService(db: Db) {
         }
       }
       await finalizeAgentStatus(agent.id, outcome);
+
+      // Model tier escalation: reset on success, escalate on real failure
+      {
+        const agentMetaForTier = (agent.metadata ?? {}) as Record<string, unknown>;
+        const currentTier = Math.min(2, Math.max(0, asNumber(agentMetaForTier.modelTier, 0)));
+        const TIER_MODELS_NAMES = ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-6"];
+        if (outcome === "succeeded") {
+          const streakWasActive = asNumber(agentMetaForTier.rateLimitStreak, 0) > 0;
+          if (currentTier > 0 || streakWasActive) {
+            await db.update(agents)
+              .set({ metadata: { ...agentMetaForTier, modelTier: 0, rateLimitStreak: 0 }, updatedAt: new Date() })
+              .where(eq(agents.id, agent.id));
+            if (currentTier > 0) logger.info({ agentId: agent.id, fromTier: currentTier, toTier: 0 }, "model tier reset to Haiku after success");
+            if (streakWasActive) logger.info({ agentId: agent.id }, "circuit breaker: rate limit streak reset after success");
+          }
+        } else if (outcome === "failed" && !isRateLimitError(adapterResult.errorMessage)) {
+          const nextTier = Math.min(2, currentTier + 1);
+          await db.update(agents)
+            .set({ metadata: { ...agentMetaForTier, modelTier: nextTier }, updatedAt: new Date() })
+            .where(eq(agents.id, agent.id));
+          logger.info(
+            { agentId: agent.id, fromTier: currentTier, toTier: nextTier, model: TIER_MODELS_NAMES[nextTier] },
+            "model tier escalated after real failure",
+          );
+          if (finalizedRun) {
+            await appendRunEvent(finalizedRun, seq++, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "Model escalated: next run will use " + TIER_MODELS_NAMES[nextTier],
+              payload: { fromTier: currentTier, toTier: nextTier, model: TIER_MODELS_NAMES[nextTier] },
+            });
+          }
+        }
+      }
+
+      // Rate-limit backoff with circuit breaker: pause agent with escalating cooldown
+      if (outcome === "failed") {
+        const resetAt = await resolveRateLimitResetAt(agent.adapterType, adapterResult.errorMessage, stderrExcerpt);
+        if (resetAt) {
+          const existingMeta = (agent.metadata ?? {}) as Record<string, unknown>;
+
+          // Circuit breaker: track consecutive rate limits and escalate pause duration
+          const prevStreak = asNumber(existingMeta.rateLimitStreak, 0);
+          const streak = prevStreak + 1;
+          // Escalating cooldown: base reset + 5min * 2^(streak-1), capped at 2 hours
+          const CIRCUIT_BREAKER_THRESHOLD = 3;
+          const MAX_EXTRA_COOLDOWN_MS = 2 * 60 * 60_000; // 2 hours
+          let effectiveResetAt = resetAt;
+          if (streak >= CIRCUIT_BREAKER_THRESHOLD) {
+            const extraMs = Math.min(
+              5 * 60_000 * Math.pow(2, streak - CIRCUIT_BREAKER_THRESHOLD),
+              MAX_EXTRA_COOLDOWN_MS,
+            );
+            effectiveResetAt = new Date(resetAt.getTime() + extraMs);
+            logger.warn(
+              { agentId: agent.id, streak, extraMs, effectiveResetAt: effectiveResetAt.toISOString() },
+              "circuit breaker: extending pause due to repeated rate limits",
+            );
+          }
+
+          await db.update(agents)
+            .set({
+              status: "paused",
+              pauseReason: "system",
+              pausedAt: new Date(),
+              metadata: {
+                ...existingMeta,
+                rateLimitResetAt: effectiveResetAt.toISOString(),
+                rateLimitStreak: streak,
+              },
+              updatedAt: new Date(),
+            })
+            .where(eq(agents.id, agent.id));
+          logger.info(
+            { agentId: agent.id, resetAt: effectiveResetAt.toISOString(), streak },
+            "rate limit detected: pausing agent until reset",
+          );
+          if (finalizedRun) {
+            const cbMsg = streak >= CIRCUIT_BREAKER_THRESHOLD
+              ? ` (circuit breaker: streak ${streak}, extended cooldown)`
+              : "";
+            await appendRunEvent(finalizedRun, seq++, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "Rate limit detected — paused until " + effectiveResetAt.toISOString() + cbMsg,
+              payload: { resetAt: effectiveResetAt.toISOString(), streak },
+            });
+          }
+          publishLiveEvent({
+            companyId: agent.companyId,
+            type: "agent.status",
+            payload: {
+              agentId: agent.id,
+              status: "paused",
+              pauseReason: "system",
+              lastHeartbeatAt: agent.lastHeartbeatAt ? new Date(agent.lastHeartbeatAt).toISOString() : null,
+              outcome: "failed",
+            },
+          });
+        }
+      }
     } catch (err) {
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
@@ -2848,6 +3056,27 @@ export function heartbeatService(db: Db) {
           level: "error",
           message,
         });
+
+        const failContext = parseObject(failedRun.contextSnapshot);
+        await logActivity(db, {
+          companyId: agent.companyId,
+          actorType: "agent",
+          actorId: agent.id,
+          action: "agent.run.failed",
+          entityType: "agent",
+          entityId: agent.id,
+          agentId: agent.id,
+          runId: failedRun.id,
+          details: {
+            runId: failedRun.id,
+            agentId: agent.id,
+            issueId: readNonEmptyString(failContext.issueId) ?? null,
+            error: message,
+          },
+        }).catch((err) => {
+          logger.warn({ err, runId: failedRun.id }, "failed to emit plugin run event");
+        });
+
         await releaseIssueExecutionAndPromote(failedRun);
 
         await updateRuntimeState(agent, failedRun, {
@@ -3905,7 +4134,29 @@ export function heartbeatService(db: Db) {
       let skipped = 0;
 
       for (const agent of allAgents) {
-        if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
+        // Auto-unpause agents paused due to rate limiting when reset time has passed
+        if (agent.status === "paused" && agent.pauseReason === "system") {
+          const meta = (agent.metadata as Record<string, unknown> | null) ?? {};
+          const resetAt = meta.rateLimitResetAt;
+          if (typeof resetAt === "string" && new Date(resetAt) <= now) {
+            // Thundering herd jitter: stagger unpause by 0–60s to avoid all agents waking at once
+            const jitterMs = Math.floor(Math.random() * 60_000);
+            const jitteredResetAt = new Date(new Date(resetAt).getTime() + jitterMs);
+            if (jitteredResetAt > now) {
+              continue; // wait for jittered time
+            }
+            const { rateLimitResetAt: _removed, ...restMeta } = meta;
+            await db.update(agents)
+              .set({ status: "idle", pauseReason: null, pausedAt: null, metadata: restMeta, updatedAt: new Date() })
+              .where(eq(agents.id, agent.id));
+            logger.info({ agentId: agent.id, jitterMs }, "rate limit reset: unpausing agent (with jitter)");
+            // Fall through so the agent fires this tick
+          } else {
+            continue;
+          }
+        } else if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+          continue;
+        }
         const policy = parseHeartbeatPolicy(agent);
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 

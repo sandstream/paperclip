@@ -5,14 +5,10 @@ export function shouldSyncCompanySelectionFromRoute(params: {
   selectedCompanyId: string | null;
   routeCompanyId: string;
 }): boolean {
-  const { selectionSource, selectedCompanyId, routeCompanyId } = params;
+  const { selectedCompanyId, routeCompanyId } = params;
 
   if (selectedCompanyId === routeCompanyId) return false;
 
-  // Let manual company switches finish their remembered-path navigation first.
-  if (selectionSource === "manual" && selectedCompanyId) {
-    return false;
-  }
-
+  // Always sync from route — deep links must resolve to the correct company.
   return true;
 }
